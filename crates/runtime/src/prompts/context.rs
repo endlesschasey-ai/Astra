@@ -376,11 +376,16 @@ impl ContextWindowPolicy {
         let raw = catalog_context_window
             .map(|tokens| tokens as usize)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
-        // Catalog metadata is authoritative. The fallback is one fixed
-        // documented reserve, clamped only to keep malformed/tiny windows
-        // arithmetically valid; it never branches on provider/model text.
+        // Catalog metadata is authoritative for the completion ceiling. The
+        // reserve charged against the input budget is that ceiling bounded at
+        // half the raw window, so legitimate shared-window metadata
+        // (max_completion == context_window, "output may use the whole
+        // window") cannot consume the entire window and leave zero input.
+        // The missing-metadata fallback stays one fixed documented reserve.
+        // Both are clamped to keep malformed/tiny windows arithmetically
+        // valid; neither branches on provider/model text.
         let output = catalog_max_completion
-            .map(|tokens| tokens as usize)
+            .map(|tokens| (tokens as usize).min(raw / 2))
             .unwrap_or_else(|| DEFAULT_OUTPUT_RESERVE_TOKENS.min((raw / 4).max(1)))
             .min(raw.saturating_sub(1));
         let protocol = DEFAULT_PROTOCOL_RESERVE_TOKENS.min(raw.saturating_sub(output));
@@ -716,6 +721,67 @@ mod tests {
         assert_eq!(policy.auto_compact_trigger_tokens, 685_623);
         assert_eq!(policy.post_compaction_target_tokens(), 594_207);
         assert_eq!(capped_output_tokens(&budget), 65_536);
+    }
+
+    #[test]
+    fn catalog_completion_equal_to_window_keeps_positive_input_budget() {
+        // Shared-window catalog metadata (issue #981: the completion limit is
+        // the whole window) must not consume the entire input budget.
+        let budget = budget_for_model_with_metadata(
+            Some("opaque-model-id"),
+            Some(1_000_000),
+            Some(1_000_000),
+        );
+        let policy = budget.window_policy();
+
+        assert_eq!(policy.source, ContextWindowPolicySource::ModelCatalog);
+        assert_eq!(policy.raw_context_window_tokens, 1_000_000);
+        assert_eq!(policy.reserved_output_tokens, 500_000);
+        assert_eq!(policy.hard_input_limit_tokens, 499_700);
+        assert_eq!(policy.reserved_summary_tokens, 20_000);
+        assert_eq!(policy.reserved_protocol_tokens, 300);
+        assert_eq!(policy.usable_input_limit_tokens, 479_700);
+        assert_eq!(policy.auto_compact_trigger_tokens, 359_775);
+        assert_eq!(capped_output_tokens(&budget), 500_000);
+    }
+
+    #[test]
+    fn catalog_completion_above_window_is_bounded_by_window() {
+        // A completion ceiling larger than the window is clamped to the same
+        // bounded reserve; arithmetic stays valid and input stays positive.
+        let budget = budget_for_model_with_metadata(
+            Some("opaque-model-id"),
+            Some(1_000_000),
+            Some(2_000_000),
+        );
+        let policy = budget.window_policy();
+
+        assert_eq!(policy.source, ContextWindowPolicySource::ModelCatalog);
+        assert_eq!(policy.reserved_output_tokens, 500_000);
+        assert_eq!(policy.usable_input_limit_tokens, 479_700);
+    }
+
+    #[test]
+    fn catalog_completion_below_half_window_keeps_exact_reserve() {
+        // Normal metadata must be unaffected by the reserve bound: the exact
+        // catalog completion limit remains the reserve.
+        for (window, completion, expected_usable) in [
+            (1_024_000_u32, 131_000_u32, 872_700_usize),
+            (1_024_000, 384_000, 619_700),
+        ] {
+            let budget = budget_for_model_with_metadata(
+                Some("opaque-model-id"),
+                Some(window),
+                Some(completion),
+            );
+            let policy = budget.window_policy();
+
+            assert_eq!(policy.source, ContextWindowPolicySource::ModelCatalog);
+            assert_eq!(policy.raw_context_window_tokens, window as usize);
+            assert_eq!(policy.reserved_output_tokens, completion as usize);
+            assert_eq!(policy.usable_input_limit_tokens, expected_usable);
+            assert_eq!(capped_output_tokens(&budget), completion as usize);
+        }
     }
 
     // === effective_input_limit (8→1) ===
